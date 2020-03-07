@@ -1,8 +1,8 @@
 #!/bin/bash -eu
 
-if [ "$BASH_SOURCE" != "$0" ]
+if [ "${BASH_SOURCE[0]}" != "$0" ]
 then
-  echo "$BASH_SOURCE must be executed, not sourced"
+  echo "${BASH_SOURCE[0]} must be executed, not sourced"
   return 1 # shouldn't use exit when sourced
 fi
 
@@ -56,19 +56,20 @@ function isPi4 {
 
 function timestamp () {
   local prefix=${1:-}
-  while IFS= read line
+  while IFS= read -r line
   do
     echo "$(date): $prefix$line"
   done
 }
 
-function fix_errors_in_mount_point () {
-  local mount_point="$1"
-  log "Running fsck on $mount_point..."
-  local backingfile=$(mount | grep -w "$mount_point" | awk '{print $1}')
-  local loopback=$(losetup -l | grep -w  "$backingfile" | awk '{print $1}')
-  /sbin/fsck "$loopback" -- -a |& timestamp '| ' >> "$LOG_FILE" || echo ""
-  log "Finished fsck on $mount_point."
+function fix_errors_in_image () {
+  local image="$1"
+  log "Running fsck on $image..."
+  losetup -f -P "$image"
+  loopback=$(losetup -j "$image" | awk '{print $1}' | sed 's/://')
+  /sbin/fsck "${loopback}p1" -- -a |& timestamp '| ' >> "$LOG_FILE" || echo ""
+  losetup -d "$loopback"
+  log "Finished fsck on $image."
 }
 
 function archive_is_reachable () {
@@ -92,7 +93,7 @@ function connect_usb_drives_to_host() {
 
 function wait_for_archive_to_be_reachable () {
   log "Waiting for archive to be reachable..."
-  while [ true ]
+  while true
   do
     if archive_is_reachable
     then
@@ -111,7 +112,7 @@ function wait_for_archive_to_be_reachable () {
 
 function retry () {
   local attempts=0
-  while [ true ]
+  while true
   do
     if eval "$@"
     then
@@ -169,10 +170,6 @@ function ensure_mountpoint_is_mounted_with_retry () {
   retry ensure_mountpoint_is_mounted "$1"
 }
 
-function fix_errors_in_cam_file () {
-  fix_errors_in_mount_point "$CAM_MOUNT"
-}
-
 function ensure_cam_file_is_mounted () {
   log "Ensuring cam file is mounted..."
   ensure_mountpoint_is_mounted_with_retry "$CAM_MOUNT"
@@ -210,13 +207,9 @@ function unmount_music_file () {
   unmount_mount_point "$MUSIC_MOUNT"
 }
 
-function fix_errors_in_music_file () {
-  fix_errors_in_mount_point "$MUSIC_MOUNT"
-}
-
 function wait_for_archive_to_be_unreachable () {
   log "Waiting for archive to be unreachable..."
-  while [ true ]
+  while true
     do
       if ! retry archive_is_reachable
       then
@@ -234,7 +227,17 @@ function wait_for_archive_to_be_unreachable () {
 }
 
 function check_if_usb_gadget_is_mounted () {
-    if [ ! -d /sys/devices/platform/soc/??980000.usb/gadget/lun0 ]
+    local found="false"
+    for lun in /sys/devices/platform/soc/??980000.usb/gadget/lun0
+    do
+      if [ -d "$lun" ]
+      then
+        found="true"
+        break
+      fi
+    done
+
+    if [ "$found" = "false" ]
     then
         log "USB Gadget not mounted. Fixing files and remounting..."
         disconnect_usb_drives_from_host
@@ -243,30 +246,19 @@ function check_if_usb_gadget_is_mounted () {
     fi
 }
 
-function mount_and_fix_errors_in_cam_file () {
-  ensure_cam_file_is_mounted
-  fix_errors_in_cam_file
-  unmount_cam_file
-}
-
-function mount_and_fix_errors_in_music_file () {
-  if [ -e "$MUSIC_MOUNT" ]
-  then
-    ensure_music_file_is_mounted
-    fix_errors_in_music_file
-    unmount_music_file
-  fi
-}
-
 function trim_free_space() {
   local mount_point="$1"
 
   # Make sure the partition is mounted.
-  if findmnt --mountpoint "$mount_point" > /dev/null
+  if found=$(findmnt -n --mountpoint "$mount_point")
   then
-    log "Trimming free space in $mount_point..."
-    if ! fstrim "$mount_point" >> "$LOG_FILE" 2>&1
+    loop=$(echo "$found" | awk '{print $2}')
+    image=$(losetup -l -n --output=BACK-FILE "$loop")
+    log "Trimming free space in $mount_point, which has $(filefrag "$image" | awk '{print $2}') extents"
+    if fstrim "$mount_point" >> "$LOG_FILE" 2>&1
     then
+      log "Trim complete, image now has $(filefrag "$image" | awk '{print $2}') extents"
+    else
       log "Trimming free space in $mount_point failed."
     fi
   else
@@ -275,8 +267,11 @@ function trim_free_space() {
 }
 
 function mount_and_fix_errors_in_files () {
-  mount_and_fix_errors_in_cam_file
-  mount_and_fix_errors_in_music_file
+  fix_errors_in_image /backingfiles/cam_disk.bin
+  if [ -e /backingfiles/music_disk.bin ]
+  then
+    fix_errors_in_image /backingfiles/music_disk.bin
+  fi
 }
 
 function disconnect_usb_drives_from_host () {
@@ -287,17 +282,15 @@ function disconnect_usb_drives_from_host () {
 
 function archive_teslacam_clips () {
     log "Checking saved folder count..."
-  
-    ensure_cam_file_is_mounted
 
-    fix_errors_in_cam_file
+    ensure_cam_file_is_mounted
   
-    DIR_COUNT=$(cd "$CAM_MOUNT"/TeslaCam && find . -maxdepth 2 -path './SavedClips/*' -o -path './SentryClips/*' -type d | wc -l)
-    FILE_COUNT=$(cd "$CAM_MOUNT"/TeslaCam && find . -maxdepth 3 -path './SavedClips/*' -o -path './SentryClips/*' -type f | wc -l)
+    DIR_COUNT=$(cd "$CAM_MOUNT"/TeslaCam && find . -maxdepth 2 -path './SavedClips/*' -type d -o -path './SentryClips/*' -type d | wc -l)
+    FILE_COUNT=$(cd "$CAM_MOUNT"/TeslaCam && find . -maxdepth 3 -path './SavedClips/*' -type f -o -path './SentryClips/*' -type f | wc -l)
   
     log "There are $DIR_COUNT event folder(s) with $FILE_COUNT file(s) to move."
   
-    if [ $DIR_COUNT -gt 0 ]
+    if [ "$DIR_COUNT" -gt 0 ]
     then
         log "Starting recording archiving: $DIR_COUNT event folder(s) with $FILE_COUNT file(s)"
 
@@ -317,9 +310,6 @@ function archive_teslacam_clips () {
 
         /root/bin/archive-clips.sh
 
-        # Trim the camera archive to reduce the number of blocks in the snapshot.
-        trim_free_space "$CAM_MOUNT"
-
         # If Sentry Mode was previously disabled, restore it to that state
         if [ -x /root/bin/tesla_api.py ]
         then
@@ -331,6 +321,9 @@ function archive_teslacam_clips () {
 	fi
     fi
 
+    # Trim the camera archive to reduce the number of blocks in the snapshot.
+    trim_free_space "$CAM_MOUNT"
+
     unmount_cam_file
 }
 
@@ -338,8 +331,6 @@ function copy_music_files () {
   log "Starting music sync..."
 
   ensure_music_file_is_mounted
-
-  fix_errors_in_music_file
 
   /root/bin/copy-music.sh
 
@@ -352,12 +343,9 @@ function copy_music_files () {
 function archive_clips () {
   log "Archiving..."
 
-  disconnect_usb_drives_from_host
-
   if ! /root/bin/connect-archive.sh
   then
     log "Couldn't connect archive, skipping archive step"
-    connect_usb_drives_to_host
     return
   fi
 
@@ -382,12 +370,11 @@ function archive_clips () {
   fi
 
   /root/bin/disconnect-archive.sh
-
-  connect_usb_drives_to_host
 }
 
 function truncate_log () {
-  local log_length=$( wc -l "$LOG_FILE" | cut -d' ' -f 1 )
+  local log_length
+  log_length=$( wc -l "$LOG_FILE" | cut -d' ' -f 1 )
   if [ "$log_length" -gt 10000 ]
   then
     log "Truncating log..."
@@ -436,7 +423,8 @@ function doubleblink () {
 
 function set_time () {
   log "Waiting for time to be set by ntpd..."
-  for i in $(seq 1 10)
+  # shellcheck disable=SC2034
+  for i in {1..10}
   do
     if ntp-wait --tries=1 --sleep=1
     then
@@ -485,7 +473,8 @@ function mount_all_snapshots {
 function snapshotloop {
   while true
   do
-    sleep 3500
+    sleep 3480
+    /root/bin/waitforidle || true
     /root/bin/make_snapshot.sh
   done
 }
@@ -508,29 +497,28 @@ then
   snapshotloop &
 fi
 
+mount_and_fix_errors_in_files
+
 if archive_is_reachable
 then
   fastblink
 
   set_time
 
-  # archive_clips will fix errors in the cam file
-  mount_and_fix_errors_in_music_file
-
   archive_clips
 
   doubleblink
+
+  connect_usb_drives_to_host
 
   wait_for_archive_to_be_unreachable
 else
   slowblink
 
-  mount_and_fix_errors_in_files
-
   connect_usb_drives_to_host
 fi
 
-while [ true ]
+while true
 do
   slowblink
 
@@ -540,19 +528,25 @@ do
 
   set_time
 
-  sleep ${ARCHIVE_DELAY:-20}
+  sleep "${ARCHIVE_DELAY:-20}"
 
-if [ "${SNAPSHOTS_ENABLED:-true}" = "true" ]
-then
-  # take a snapshot before archive_clips starts deleting files
-  /root/bin/make_snapshot.sh
-fi
+  if [ "${SNAPSHOTS_ENABLED:-true}" = "true" ]
+  then
+    # take a snapshot before archive_clips starts deleting files
+    /root/bin/make_snapshot.sh
+  fi
+
+  disconnect_usb_drives_from_host
+
+  mount_and_fix_errors_in_files
 
   archive_clips
 
   truncate_log
 
   doubleblink
+
+  connect_usb_drives_to_host
 
   wait_for_archive_to_be_unreachable
 
